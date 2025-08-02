@@ -1,0 +1,29 @@
+{
+  "name": "froge-leaderboard",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "ponder dev",
+    "start": "ponder start",
+    "db": "ponder db",
+    "codegen": "ponder codegen",
+    "lint": "eslint .",
+    "typecheck": "tsc"
+  },
+  "dependencies": {
+    "ponder": "^0.12.0",
+    "hono": "^4.5.0",
+    "viem": "^2.21.3"
+  },
+  "devDependencies": {
+    "@types/node": "^20.9.0",
+    "eslint": "^8.53.0",
+    "eslint-config-ponder": "^0.12.0",
+    "typescript": "^5.2.2"
+  },
+  "engines": {
+    "node": ">=18.14"
+  },
+  "packageManager": "pnpm@8.15.3+sha512.dd85cd6eca6417c6f73db32ba1eb4767ffb4cba4f5bf0727846722c92b6b9e56a2cc218b11385bbc2b21f18a16a67da77aceae9b61a0f56a1643b25e1fb6a605"
+}
