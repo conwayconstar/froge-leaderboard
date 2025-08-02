@@ -6,13 +6,29 @@ const app = new Hono();
 
 // Constants
 const DEPLOYER_ADDRESS = "0x34919f7dd781e5cdbda923392dbc627add997a8f";
+const POOL_ADDRESS = "0x5628F3bb1f352f86Ea173184ffEe2E34b8fc2dc8";
 const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
+const DEAD_ADDRESS = "0x000000000000000000000000000000000000dead";
+
+// Burn addresses (tokens sent here are considered burned)
+const BURN_ADDRESSES = new Set([
+	ZERO_ADDRESS.toLowerCase(),
+	DEAD_ADDRESS.toLowerCase(),
+]);
+
+// Addresses to exclude from leaderboard
+const EXCLUDED_ADDRESSES = new Set([
+	ZERO_ADDRESS.toLowerCase(),
+	DEAD_ADDRESS.toLowerCase(),
+	POOL_ADDRESS.toLowerCase(),
+]);
 
 // Scoring weights and multipliers
 const SCORING = {
 	BALANCE_WEIGHT: 40,
 	TIME_WEIGHTED_WEIGHT: 40,
 	SOLD_PENALTY_WEIGHT: 20,
+	BURNED_WEIGHT: 15, // Burning tokens benefits everyone by reducing supply
 	DIAMOND_HANDS_BONUS: 1.1,
 	OG_BONUS: 1.15,
 	PAPER_HANDS_PENALTY: 0.5,
@@ -37,6 +53,7 @@ function createInitialHolderMetrics() {
 		totalReceived: 0n,
 		totalSent: 0n,
 		totalSold: 0n,
+		totalBurned: 0n, // Tokens sent to burn addresses
 		totalProfitEth: 0n,
 		timeWeightedBalance: 0n,
 		hasBought: false,
@@ -51,6 +68,7 @@ interface HolderMetrics {
 	totalReceived: bigint;
 	totalSent: bigint;
 	totalSold: bigint;
+	totalBurned: bigint;
 	totalProfitEth: bigint;
 	timeWeightedBalance: bigint;
 	hasBought: boolean;
@@ -65,6 +83,7 @@ interface HolderData {
 	totalReceived: string;
 	totalSent: string;
 	totalSold: string;
+	totalBurned: string;
 	totalProfitEth: string;
 	timeWeightedBalance: string;
 	historicalHighBalance: string;
@@ -113,6 +132,11 @@ function processTransfers(transfers: any[], holderMetrics: Map<string, HolderMet
 			const holder = holderMetrics.get(from)!;
 			holder.balance -= value;
 			holder.totalSent += value;
+
+			// Track burns (tokens sent to burn addresses)
+			if (BURN_ADDRESSES.has(to.toLowerCase())) {
+				holder.totalBurned += value;
+			}
 
 			holder.balanceHistory.push({
 				timestamp: Number(timestamp),
@@ -197,6 +221,7 @@ function calculateScore(
 	balance: bigint,
 	timeWeightedBalance: bigint,
 	totalSold: bigint,
+	totalBurned: bigint,
 	historicalHighBalance: bigint,
 	isOG: boolean
 ): number {
@@ -204,7 +229,8 @@ function calculateScore(
 	let score =
 		log10BigInt(balance + 1n) * SCORING.BALANCE_WEIGHT +
 		log10BigInt(timeWeightedBalance + 1n) * SCORING.TIME_WEIGHTED_WEIGHT -
-		log10BigInt(totalSold + 1n) * SCORING.SOLD_PENALTY_WEIGHT;
+		log10BigInt(totalSold + 1n) * SCORING.SOLD_PENALTY_WEIGHT +
+		log10BigInt(totalBurned + 1n) * SCORING.BURNED_WEIGHT;
 
 	// Apply bonuses and penalties
 	if (balance === 0n && totalSold > 0n) {
@@ -249,14 +275,18 @@ app.get("/leaderboard", async (c) => {
 
 		// Convert to leaderboard format
 		const leaderboard: HolderData[] = Array.from(holderMetrics.entries())
-			.filter(([_, metrics]) => 
-				metrics.balance > 0n || metrics.totalReceived > 0n || metrics.totalSent > 0n
-			)
+			.filter(([address, metrics]) => {
+				// Exclude zero address, pool address, and inactive holders
+				const isExcluded = EXCLUDED_ADDRESSES.has(address.toLowerCase());
+				const hasActivity = metrics.balance > 0n || metrics.totalReceived > 0n || metrics.totalSent > 0n;
+				return !isExcluded && hasActivity;
+			})
 			.map(([address, metrics]) => {
 				const score = calculateScore(
 					metrics.balance,
 					metrics.timeWeightedBalance,
 					metrics.totalSold,
+					metrics.totalBurned,
 					metrics.historicalHighBalance,
 					metrics.isOG
 				);
@@ -271,6 +301,7 @@ app.get("/leaderboard", async (c) => {
 					totalReceived: metrics.totalReceived.toString(),
 					totalSent: metrics.totalSent.toString(),
 					totalSold: metrics.totalSold.toString(),
+					totalBurned: metrics.totalBurned.toString(),
 					totalProfitEth: metrics.totalProfitEth.toString(),
 					timeWeightedBalance: metrics.timeWeightedBalance.toString(),
 					historicalHighBalance: metrics.historicalHighBalance.toString(),
@@ -296,10 +327,11 @@ app.get("/", (c) => {
 			"/leaderboard": "Get holder leaderboard with scores calculated from transfer and swap data",
 		},
 		scoring: {
-			formula: `log10(balance + 1) * ${SCORING.BALANCE_WEIGHT} + log10(timeWeightedBalance + 1) * ${SCORING.TIME_WEIGHTED_WEIGHT} - log10(totalSold + 1) * ${SCORING.SOLD_PENALTY_WEIGHT}`,
+			formula: `log10(balance + 1) * ${SCORING.BALANCE_WEIGHT} + log10(timeWeightedBalance + 1) * ${SCORING.TIME_WEIGHTED_WEIGHT} - log10(totalSold + 1) * ${SCORING.SOLD_PENALTY_WEIGHT} + log10(totalBurned + 1) * ${SCORING.BURNED_WEIGHT}`,
 			bonuses: {
 				"Diamond hands (never sold)": `${SCORING.DIAMOND_HANDS_BONUS}x`,
 				"OG (received from deployer)": `${SCORING.OG_BONUS}x`,
+				"Token burning (reduces supply)": `+${SCORING.BURNED_WEIGHT} weight`,
 			},
 			penalties: {
 				"Sold everything": `${SCORING.PAPER_HANDS_PENALTY}x`,
@@ -315,6 +347,9 @@ app.get("/", (c) => {
 		},
 		config: {
 			deployerAddress: DEPLOYER_ADDRESS,
+			poolAddress: POOL_ADDRESS,
+			burnAddresses: Array.from(BURN_ADDRESSES),
+			excludedAddresses: Array.from(EXCLUDED_ADDRESSES),
 		},
 	});
 });
