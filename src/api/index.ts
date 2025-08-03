@@ -28,7 +28,8 @@ const SCORING = {
 	BALANCE_WEIGHT: 40,
 	TIME_WEIGHTED_WEIGHT: 40,
 	SOLD_PENALTY_WEIGHT: 20,
-	BURNED_WEIGHT: 15, // Burning tokens benefits everyone by reducing supply
+	BURNED_WEIGHT: 4, // Burning tokens benefits everyone by reducing supply
+	PROFIT_WEIGHT: 6, // Modest reward for profitable trading
 	DIAMOND_HANDS_BONUS: 1.1,
 	OG_BONUS: 1.15,
 	PAPER_HANDS_PENALTY: 0.5,
@@ -146,43 +147,69 @@ function processTransfers(transfers: any[], holderMetrics: Map<string, HolderMet
 	}
 }
 
-// Process swaps and update holder metrics
-function processSwaps(swaps: any[], holderMetrics: Map<string, HolderMetrics>) {
+// Process swaps and update holder metrics based on corresponding transfers
+function processSwaps(swaps: any[], transfers: any[], holderMetrics: Map<string, HolderMetrics>) {
+	// Group transfers by transaction hash for quick lookup
+	const transfersByTxHash = new Map<string, any[]>();
+	for (const transfer of transfers) {
+		const txHash = transfer.txHash;
+		if (!transfersByTxHash.has(txHash)) {
+			transfersByTxHash.set(txHash, []);
+		}
+		transfersByTxHash.get(txHash)!.push(transfer);
+	}
+
 	for (const swap of swaps) {
-		const { sender, recipient, amount0, amount1, effectivePrice } = swap;
-
-		// Handle swap selling (positive amount0 = selling our token)
-		if (amount0 > 0n) {
-			if (!holderMetrics.has(sender)) {
-				holderMetrics.set(sender, createInitialHolderMetrics());
+		const { txHash, sender, recipient, amount0, amount1, effectivePrice } = swap;
+		
+		// Find corresponding transfers for this swap
+		const swapTransfers = transfersByTxHash.get(txHash) || [];
+		
+		// Process each transfer in this transaction to determine buy/sell
+		for (const transfer of swapTransfers) {
+			const { from, to, value } = transfer;
+			
+			// Skip pool and zero address transfers
+			if (from === POOL_ADDRESS || to === POOL_ADDRESS || 
+			    from === ZERO_ADDRESS || to === ZERO_ADDRESS) {
+				continue;
 			}
-			const holder = holderMetrics.get(sender)!;
-			holder.totalSold += amount0;
 
-			// Only calculate profit if they have actually bought tokens
-			if (holder.hasBought) {
+			// Handle seller (transfer FROM) - someone sending tokens out
+			if (from !== ZERO_ADDRESS && !EXCLUDED_ADDRESSES.has(from.toLowerCase())) {
+				if (!holderMetrics.has(from)) {
+					holderMetrics.set(from, createInitialHolderMetrics());
+				}
+				const holder = holderMetrics.get(from)!;
+				
+				// Track tokens sold
+				holder.totalSold += value;
+
+				// Calculate profit if they have actually bought tokens
+				if (holder.hasBought) {
+					const amt1 = BigInt(amount1);
+					const price = BigInt(effectivePrice);
+					holder.totalProfitEth +=
+						((amt1 < 0n ? -amt1 : amt1) * price) / (10n ** 18n);
+				}
+			}
+
+			// Handle buyer (transfer TO) - someone receiving tokens
+			if (to !== ZERO_ADDRESS && !EXCLUDED_ADDRESSES.has(to.toLowerCase())) {
+				if (!holderMetrics.has(to)) {
+					holderMetrics.set(to, createInitialHolderMetrics());
+				}
+				const holder = holderMetrics.get(to)!;
+
+				// Mark as having bought via swap
+				holder.hasBought = true;
+
+				// Calculate the cost of buying (negative profit initially)
 				const amt1 = BigInt(amount1);
 				const price = BigInt(effectivePrice);
-				holder.totalProfitEth +=
-					((amt1 < 0n ? -amt1 : amt1) * price) / (10n ** 18n);
+				holder.totalProfitEth -=
+					((amt1 > 0n ? amt1 : -amt1) * price) / (10n ** 18n);
 			}
-		}
-
-		// Handle swap buying (negative amount0 = buying our token)
-		if (amount0 < 0n) {
-			if (!holderMetrics.has(recipient)) {
-				holderMetrics.set(recipient, createInitialHolderMetrics());
-			}
-			const holder = holderMetrics.get(recipient)!;
-
-			// Mark as having bought via swap
-			holder.hasBought = true;
-
-			// Calculate the cost of buying (negative profit initially)
-			const amt1 = BigInt(amount1);
-			const price = BigInt(effectivePrice);
-			holder.totalProfitEth -=
-				((amt1 > 0n ? amt1 : -amt1) * price) / (10n ** 18n);
 		}
 	}
 }
@@ -222,6 +249,7 @@ function calculateScore(
 	timeWeightedBalance: bigint,
 	totalSold: bigint,
 	totalBurned: bigint,
+	totalProfitEth: bigint,
 	historicalHighBalance: bigint,
 	isOG: boolean
 ): number {
@@ -231,6 +259,11 @@ function calculateScore(
 		log10BigInt(timeWeightedBalance + 1n) * SCORING.TIME_WEIGHTED_WEIGHT -
 		log10BigInt(totalSold + 1n) * SCORING.SOLD_PENALTY_WEIGHT +
 		log10BigInt(totalBurned + 1n) * SCORING.BURNED_WEIGHT;
+
+	// Add profit bonus (only for positive profits, no penalty for losses)
+	if (totalProfitEth > 0n) {
+		score += log10BigInt(totalProfitEth + 1n) * SCORING.PROFIT_WEIGHT;
+	}
 
 	// Apply bonuses and penalties
 	if (balance === 0n && totalSold > 0n) {
@@ -270,7 +303,7 @@ app.get("/leaderboard", async (c) => {
 		const holderMetrics = new Map<string, HolderMetrics>();
 		
 		processTransfers(transfers, holderMetrics);
-		processSwaps(swaps, holderMetrics);
+		processSwaps(swaps, transfers, holderMetrics);
 		calculateTimeWeightedBalances(holderMetrics);
 
 		// Convert to leaderboard format
@@ -287,6 +320,7 @@ app.get("/leaderboard", async (c) => {
 					metrics.timeWeightedBalance,
 					metrics.totalSold,
 					metrics.totalBurned,
+					metrics.totalProfitEth,
 					metrics.historicalHighBalance,
 					metrics.isOG
 				);
@@ -327,11 +361,12 @@ app.get("/", (c) => {
 			"/leaderboard": "Get holder leaderboard with scores calculated from transfer and swap data",
 		},
 		scoring: {
-			formula: `log10(balance + 1) * ${SCORING.BALANCE_WEIGHT} + log10(timeWeightedBalance + 1) * ${SCORING.TIME_WEIGHTED_WEIGHT} - log10(totalSold + 1) * ${SCORING.SOLD_PENALTY_WEIGHT} + log10(totalBurned + 1) * ${SCORING.BURNED_WEIGHT}`,
+			formula: `log10(balance + 1) * ${SCORING.BALANCE_WEIGHT} + log10(timeWeightedBalance + 1) * ${SCORING.TIME_WEIGHTED_WEIGHT} - log10(totalSold + 1) * ${SCORING.SOLD_PENALTY_WEIGHT} + log10(totalBurned + 1) * ${SCORING.BURNED_WEIGHT} + log10(totalProfitEth + 1) * ${SCORING.PROFIT_WEIGHT} (if profit > 0)`,
 			bonuses: {
 				"Diamond hands (never sold)": `${SCORING.DIAMOND_HANDS_BONUS}x`,
 				"OG (received from deployer)": `${SCORING.OG_BONUS}x`,
 				"Token burning (reduces supply)": `+${SCORING.BURNED_WEIGHT} weight`,
+				"Profitable trading": `+${SCORING.PROFIT_WEIGHT} weight (no penalty for losses)`,
 			},
 			penalties: {
 				"Sold everything": `${SCORING.PAPER_HANDS_PENALTY}x`,
